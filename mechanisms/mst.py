@@ -16,18 +16,31 @@ Unlike the original implementation, this one can work for any discrete dataset,
 and does not rely on public provisional data for measurement selection.  
 """
 
+
 def MST(data, epsilon, delta):
+    est, undo_compress_fn = mst_estimate(data, epsilon, delta)
+    return mst_synthesize(est, undo_compress_fn)
+
+
+def mst_synthesize(est, undo_compress_fn):
+    synth = est.synthetic_data()
+    return undo_compress_fn(synth)
+
+
+def mst_estimate(data, epsilon, delta, backend='numpy', iters=200, column_combinations_to_match=None, show_log=False):
     rho = cdp_rho(epsilon, delta)
-    sigma = np.sqrt(3/(2*rho))
+    sigma = np.sqrt(3 / (2 * rho))
     cliques = [(col,) for col in data.domain]
     log1 = measure(data, cliques, sigma)
     data, log1, undo_compress_fn = compress_domain(data, log1)
-    cliques = select(data, rho/3.0, log1)
+    cliques = column_combinations_to_match
+    if cliques is None:
+        cliques = select(data, rho / 3.0, log1)
     log2 = measure(data, cliques, sigma)
-    engine = FactoredInference(data.domain, iters=5000)
-    est = engine.estimate(log1+log2)
-    synth = est.synthetic_data()
-    return undo_compress_fn(synth)
+    engine = FactoredInference(data.domain, iters=iters, backend=backend, log=show_log)
+    est = engine.estimate(log1 + log2)
+    return est, undo_compress_fn
+
 
 def measure(data, cliques, sigma, weights=None):
     if weights is None:
@@ -36,35 +49,38 @@ def measure(data, cliques, sigma, weights=None):
     measurements = []
     for proj, wgt in zip(cliques, weights):
         x = data.project(proj).datavector()
-        y = x + np.random.normal(loc=0, scale=sigma/wgt, size=x.size)
+        y = x + np.random.normal(loc=0, scale=sigma / wgt, size=x.size)
         Q = sparse.eye(x.size)
-        measurements.append( (Q, y, sigma/wgt, proj) )
+        measurements.append((Q, y, sigma / wgt, proj))
     return measurements
+
 
 def compress_domain(data, measurements):
     supports = {}
     new_measurements = []
     for Q, y, sigma, proj in measurements:
         col = proj[0]
-        sup = y >= 3*sigma
+        sup = y >= 3 * sigma
         supports[col] = sup
         if supports[col].sum() == y.size:
-            new_measurements.append( (Q, y, sigma, proj) )
-        else: # need to re-express measurement over the new domain
+            new_measurements.append((Q, y, sigma, proj))
+        else:  # need to re-express measurement over the new domain
             y2 = np.append(y[sup], y[~sup].sum())
             I2 = np.ones(y2.size)
             I2[-1] = 1.0 / np.sqrt(y.size - y2.size + 1.0)
             y2[-1] /= np.sqrt(y.size - y2.size + 1.0)
             I2 = sparse.diags(I2)
-            new_measurements.append( (I2, y2, sigma, proj) )
+            new_measurements.append((I2, y2, sigma, proj))
     undo_compress_fn = lambda data: reverse_data(data, supports)
     return transform_data(data, supports), new_measurements, undo_compress_fn
 
+
 def exponential_mechanism(q, eps, sensitivity, prng=np.random, monotonic=False):
     coef = 1.0 if monotonic else 0.5
-    scores = coef*eps/sensitivity*q
+    scores = coef * eps / sensitivity * q
     probas = np.exp(scores - logsumexp(scores))
     return prng.choice(q.size, p=probas)
+
 
 def select(data, rho, measurement_log, cliques=[]):
     engine = FactoredInference(data.domain, iters=1000)
@@ -75,7 +91,7 @@ def select(data, rho, measurement_log, cliques=[]):
     for a, b in candidates:
         xhat = est.project([a, b]).datavector()
         x = data.project([a, b]).datavector()
-        weights[a,b] = np.linalg.norm(x - xhat, 1)
+        weights[a, b] = np.linalg.norm(x - xhat, 1)
 
     T = nx.Graph()
     T.add_nodes_from(data.domain.attrs)
@@ -86,8 +102,8 @@ def select(data, rho, measurement_log, cliques=[]):
         ds.union(*e)
 
     r = len(list(nx.connected_components(T)))
-    epsilon = np.sqrt(8*rho/(r-1))
-    for i in range(r-1):
+    epsilon = np.sqrt(8 * rho / (r - 1))
+    for i in range(r - 1):
         candidates = [e for e in candidates if not ds.connected(*e)]
         wgts = np.array([weights[e] for e in candidates])
         idx = exponential_mechanism(wgts, epsilon, sensitivity=1.0)
@@ -96,6 +112,7 @@ def select(data, rho, measurement_log, cliques=[]):
         ds.union(*e)
 
     return list(T.edges)
+
 
 def transform_data(data, supports):
     df = data.df.copy()
@@ -118,6 +135,7 @@ def transform_data(data, supports):
     newdom = Domain.fromdict(newdom)
     return Dataset(df, newdom)
 
+
 def reverse_data(data, supports):
     df = data.df.copy()
     newdom = {}
@@ -134,6 +152,7 @@ def reverse_data(data, supports):
         df.loc[~mask, col] = idx[df.loc[~mask, col]]
     newdom = Domain.fromdict(newdom)
     return Dataset(df, newdom)
+
 
 def default_params():
     """
@@ -180,14 +199,14 @@ if __name__ == '__main__':
         workload = [workload[i] for i in prng.choice(len(workload), args.num_marginals, replace=False)]
 
     synth = MST(data, args.epsilon, args.delta)
-  
+
     if args.save is not None:
         synth.df.to_csv(args.save, index=False)
- 
+
     errors = []
     for proj in workload:
         X = data.project(proj).datavector()
         Y = synth.project(proj).datavector()
-        e = 0.5*np.linalg.norm(X/X.sum() - Y/Y.sum(), 1)
+        e = 0.5 * np.linalg.norm(X / X.sum() - Y / Y.sum(), 1)
         errors.append(e)
-    print('Average Error: ', np.mean(errors)) 
+    print('Average Error: ', np.mean(errors))
