@@ -5,8 +5,10 @@ from scipy import optimize, sparse
 from functools import partial
 from collections import defaultdict
 
+
 class FactoredInference:
-    def __init__(self, domain, backend = 'numpy', structural_zeros = {}, metric='L2', log=False, iters=1000, warm_start=False, elim_order=None):
+    def __init__(self, domain, backend='numpy', structural_zeros={}, metric='L2', log=False, iters=1000,
+                 warm_start=False, elim_order=None, early_stop_loss=None):
         """
         Class for learning a GraphicalModel from  noisy measurements on a data distribution
         
@@ -25,6 +27,8 @@ class FactoredInference:
         :param elim_order: an elimination order for the JunctionTree algorithm
             - Elimination order will impact the efficiency by not correctness.  
               By default, a greedy elimination order is used
+        :param early_stop_loss: will stop when the loss for the default `metric` drops below the given float value
+            (default: None, ie early stop disabled)
         """
         self.domain = domain
         self.backend = backend
@@ -34,20 +38,21 @@ class FactoredInference:
         self.warm_start = warm_start
         self.history = []
         self.elim_order = elim_order
+        self.early_stop_loss = early_stop_loss
         if backend == 'torch':
             from mbi.torch_factor import Factor
             self.Factor = Factor
         else:
             from mbi import Factor
-            self.Factor= Factor
+            self.Factor = Factor
 
         self.structural_zeros = CliqueVector({})
         for cl in structural_zeros:
             dom = self.domain.project(cl)
             fact = structural_zeros[cl]
-            self.structural_zeros[cl] = self.Factor.active(dom,fact)
+            self.structural_zeros[cl] = self.Factor.active(dom, fact)
 
-    def estimate(self, measurements, total = None, engine='MD', callback=None, options = {}):
+    def estimate(self, measurements, total=None, engine='MD', callback=None, options={}):
         """ 
         Estimate a GraphicalModel from the given measurements
 
@@ -79,10 +84,9 @@ class FactoredInference:
             self.interior_gradient(measurements, total, **options)
         return self.model
 
-
     def fix_measurements(self, measurements):
         assert type(measurements) is list, 'measurements must be a list, given ' + measurements
-        assert all(len(m)==4 for m in measurements), \
+        assert all(len(m) == 4 for m in measurements), \
             'each measurement must be a 4-tuple (Q, y, noise,proj)'
         ans = []
         for Q, y, noise, proj in measurements:
@@ -96,10 +100,10 @@ class FactoredInference:
             assert np.isscalar(noise), 'noise must be a real value, given ' + str(noise)
             assert all(a in self.domain for a in proj), str(proj) + ' not contained in domain'
             assert Q.shape[1] == self.domain.size(proj), 'shapes of Q and proj are not compatible'
-            ans.append( (Q, y, noise, proj) )
+            ans.append((Q, y, noise, proj))
         return ans
 
-    def interior_gradient(self, measurements, total, lipschitz = None,c = 1,sigma = 1,callback=None):
+    def interior_gradient(self, measurements, total, lipschitz=None, c=1, sigma=1, callback=None):
         """ Use the interior gradient algorithm to estimate the GraphicalModel
             See https://epubs.siam.org/doi/pdf/10.1137/S1052623403427823 for more information
 
@@ -117,7 +121,7 @@ class FactoredInference:
         :param callback: a function to be called after each iteration of optimization
         """
         assert self.metric != 'L1', 'dual_averaging cannot be used with metric=L1'
-        assert not callable(self.metric) or lipschitz is not None,'lipschitz constant must be supplied'
+        assert not callable(self.metric) or lipschitz is not None, 'lipschitz constant must be supplied'
         self._setup(measurements, total)
         # what are c and sigma?  For now using 1
         model = self.model
@@ -125,26 +129,28 @@ class FactoredInference:
         L = self._lipschitz(measurements) if lipschitz is None else lipschitz
         if self.log:
             print('Lipchitz constant:', L)
-    
+
         theta = model.potentials
         x = y = z = model.belief_propagation(theta)
         c0 = c
-        l = sigma/L
-        for k in range(1, self.iters+1):
-            a = (np.sqrt((c*l)**2 + 4*c*l) - l*c) / 2
-            y = (1 - a)*x + a*z
-            c *= (1-a)
-            _, g = self._marginal_loss(y) 
-            theta = theta - a/c/total * g
+        l = sigma / L
+        for k in range(1, self.iters + 1):
+            a = (np.sqrt((c * l) ** 2 + 4 * c * l) - l * c) / 2
+            y = (1 - a) * x + a * z
+            c *= (1 - a)
+            loss, g = self._marginal_loss(y)
+            theta = theta - a / c / total * g
             z = model.belief_propagation(theta)
-            x = (1-a)*x + a*z
+            x = (1 - a) * x + a * z
             if callback is not None:
                 callback(x)
+            if self.early_stop_loss is not None and loss < self.early_stop_loss:
+                break
 
         model.marginals = x
-        model.potentials = model.mle(x) 
+        model.potentials = model.mle(x)
 
-    def dual_averaging(self, measurements, total = None, lipschitz = None, callback=None):
+    def dual_averaging(self, measurements, total=None, lipschitz=None, callback=None):
         """ Use the regularized dual averaging algorithm to estimate the GraphicalModel
             See https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/xiao10JMLR.pdf
 
@@ -161,35 +167,38 @@ class FactoredInference:
         :param callback: a function to be called after each iteration of optimization
         """
         assert self.metric != 'L1', 'dual_averaging cannot be used with metric=L1'
-        assert not callable(self.metric) or lipschitz is not None,'lipschitz constant must be supplied'
+        assert not callable(self.metric) or lipschitz is not None, 'lipschitz constant must be supplied'
         self._setup(measurements, total)
         model = self.model
         domain, cliques, total = model.domain, model.cliques, model.total
         L = self._lipschitz(measurements) if lipschitz is None else lipschitz
         print('Lipchitz constant:', L)
         if L == 0: return
- 
+
         theta = model.potentials
-        gbar = CliqueVector({ cl : self.Factor.zeros(domain.project(cl)) for cl in cliques })
+        gbar = CliqueVector({cl: self.Factor.zeros(domain.project(cl)) for cl in cliques})
         w = v = model.belief_propagation(theta)
         beta = 0
 
-        for t in range(1, self.iters+1):
+        for t in range(1, self.iters + 1):
             c = 2.0 / (t + 1)
-            u = (1-c)*w + c*v
-            _, g = self._marginal_loss(u) # not interested in loss of this query point
-            gbar = (1-c)*gbar + c*g
-            theta = -t*(t+1)/(4*L+beta)/self.model.total * gbar 
+            u = (1 - c) * w + c * v
+            loss, g = self._marginal_loss(u)  # not interested in loss of this query point
+            gbar = (1 - c) * gbar + c * g
+            theta = -t * (t + 1) / (4 * L + beta) / self.model.total * gbar
             v = model.belief_propagation(theta)
-            w = (1-c)*w + c*v
-           
+            w = (1 - c) * w + c * v
+
             if callback is not None:
                 callback(w)
 
-        model.marginals = w
-        model.potentials = model.mle(w) 
+            if self.early_stop_loss is not None and loss < self.early_stop_loss:
+                break
 
-    def mirror_descent(self, measurements, total = None, stepsize = None, callback=None):
+        model.marginals = w
+        model.potentials = model.mle(w)
+
+    def mirror_descent(self, measurements, total=None, stepsize=None, callback=None):
         """ Use the mirror descent algorithm to estimate the GraphicalModel
             See https://web.iem.technion.ac.il/images/user-files/becka/papers/3.pdf
         
@@ -206,8 +215,8 @@ class FactoredInference:
         :param callback: a function to be called after each iteration of optimization
         """
         assert not (self.metric == 'L1' and stepsize is None), \
-                'loss function not smooth, cannot use line search (specify stepsize)'
-        
+            'loss function not smooth, cannot use line search (specify stepsize)'
+
         self._setup(measurements, total)
         model = self.model
         cliques, theta = model.cliques, model.potentials
@@ -221,23 +230,25 @@ class FactoredInference:
             alpha = float(stepsize)
             stepsize = lambda t: alpha
         if stepsize is None:
-            alpha = 1.0 / self.model.total**2
-            stepsize = lambda t: 2.0*alpha
+            alpha = 1.0 / self.model.total ** 2
+            stepsize = lambda t: 2.0 * alpha
 
         for t in range(1, self.iters + 1):
             if callback is not None:
                 callback(mu)
             omega, nu = theta, mu
             curr_loss, dL = ans
-            #print('Gradient Norm', np.sqrt(dL.dot(dL)))
+            # print('Gradient Norm', np.sqrt(dL.dot(dL)))
             alpha = stepsize(t)
             for i in range(25):
-                theta = omega - alpha*dL
+                theta = omega - alpha * dL
                 mu = model.belief_propagation(theta)
                 ans = self._marginal_loss(mu)
-                if nols or curr_loss - ans[0] >= 0.5*alpha*dL.dot(nu-mu):
+                if nols or curr_loss - ans[0] >= 0.5 * alpha * dL.dot(nu - mu):
                     break
                 alpha *= 0.5
+            if self.early_stop_loss is not None and ans[0] < self.early_stop_loss:
+                break
 
         model.potentials = theta
         model.marginals = mu
@@ -258,23 +269,23 @@ class FactoredInference:
             return metric(marginals)
 
         loss = 0.0
-        gradient = { }
+        gradient = {}
 
         for cl in marginals:
             mu = marginals[cl]
             gradient[cl] = self.Factor.zeros(mu.domain)
             for Q, y, noise, proj in self.groups[cl]:
-                c = 1.0/noise
+                c = 1.0 / noise
                 mu2 = mu.project(proj)
                 x = mu2.datavector()
-                diff = c*(Q @ x - y)
+                diff = c * (Q @ x - y)
                 if metric == 'L1':
                     loss += abs(diff).sum()
                     sign = diff.sign() if hasattr(diff, 'sign') else np.sign(diff)
-                    grad = c*(Q.T @ sign)
+                    grad = c * (Q.T @ sign)
                 else:
-                    loss += 0.5*(diff @ diff)
-                    grad = c*(Q.T @ diff)
+                    loss += 0.5 * (diff @ diff)
+                    grad = c * (Q.T @ diff)
                 gradient[cl] += self.Factor(mu2.domain, grad)
         return float(loss), CliqueVector(gradient)
 
@@ -294,7 +305,7 @@ class FactoredInference:
                 o = np.ones(Q.shape[1])
                 v = lsmr(Q.T, o, atol=0, btol=0)[0]
                 if np.allclose(Q.T.dot(v), o):
-                    variances = np.append(variances, noise**2 * np.dot(v, v))
+                    variances = np.append(variances, noise ** 2 * np.dot(v, v))
                     estimates = np.append(estimates, np.dot(v, y))
             if estimates.size == 0:
                 total = 1
@@ -303,25 +314,25 @@ class FactoredInference:
                 estimate = variance * np.sum(estimates / variances)
                 total = max(1, estimate)
 
-        #if not self.warm_start or not hasattr(self, 'model'):
+        # if not self.warm_start or not hasattr(self, 'model'):
         # initialize the model and parameters
-        cliques = [m[3] for m in measurements] 
+        cliques = [m[3] for m in measurements]
         if self.structural_zeros is not None:
             cliques += list(self.structural_zeros.keys())
 
-        model = GraphicalModel(self.domain,cliques,total,elimination_order=self.elim_order)
+        model = GraphicalModel(self.domain, cliques, total, elimination_order=self.elim_order)
 
         model.potentials = CliqueVector.zeros(self.domain, model.cliques)
         model.potentials.combine(self.structural_zeros)
         if self.warm_start and hasattr(self, 'model'):
             model.potentials.combine(self.model.potentials)
-        self.model = model  
- 
+        self.model = model
+
         # group the measurements into model cliques 
         cliques = self.model.cliques
-        #self.groups = { cl : [] for cl in cliques }
+        # self.groups = { cl : [] for cl in cliques }
         self.groups = defaultdict(lambda: [])
-        for Q,y,noise,proj in measurements:
+        for Q, y, noise, proj in measurements:
             if self.backend == 'torch':
                 import torch
                 device = self.Factor.device
@@ -347,7 +358,7 @@ class FactoredInference:
 
             Note: must be called after _setup
         """
-        eigs = { cl : 0.0 for cl in self.model.cliques }
+        eigs = {cl: 0.0 for cl in self.model.cliques}
         for Q, _, noise, proj in measurements:
             for cl in self.model.cliques:
                 if set(proj) <= set(cl):
@@ -356,7 +367,7 @@ class FactoredInference:
                     Q = aslinearoperator(Q)
                     Q.dtype = np.dtype(Q.dtype)
                     eig = eigsh(Q.H * Q, 1)[0][0]
-                    eigs[cl] += eig * n / p / noise**2
+                    eigs[cl] += eig * n / p / noise ** 2
                     break
         return max(eigs.values())
 
